@@ -104,7 +104,7 @@
     "ZED_LITE_BATCH": 32,
     "ZED_LITE_CROP": 128,
     "ZED_ENT_STRIDE": 1,
-    "HF_TOKEN": "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",
+    "HF_TOKEN": "",
     "CLUSTER_METHOD": "kmeans",
     "CLUSTER_K_RANGE": [
       4,
