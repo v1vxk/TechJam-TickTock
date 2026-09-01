@@ -49,12 +49,15 @@ top; the defaults reproduce the shipped model (`SEED=42`).
 
 ## 4. Limitations and what we would improve with more time
 
-* **The semantic branch carries a dataset shortcut.** Ablations (`forensics_only_forest.py`) show the purely forensic features reach
+* **The semantic branch may carry a dataset shortcut.** Ablations (`forensics_only_forest.py`) show the purely forensic features reach
   AUC 0.91 (test) / 0.95 (demo) on their own, and the CLIP-derived features add ~0.05–0.07 — but on a single-source pair CLIP alone
-  separates "photo-like" from "prompt-like" content almost perfectly and survives blur that destroys every forensic cue. Multi-source
+  separates "photo-like" from "prompt-like" content almost perfectly and survives blur that destroys most forensic cues. Multi-source
   training shrank that free lunch; it did not remove it. With more time: train on content-matched pairs (real photos and generations
-  from the same captions) so semantics stop correlating with the label, and report the forensics-only model as the primary detector.
-* **Two dataset artefacts remain after levelling.** Real photos are JPEG-compressed twice (source + levelling) while generator PNGs are compressed once, and generators emit large square images while photo datasets do not. `harden_eval_subset.py` equalises both and re-scores; we recommend quoting the hardened numbers alongside the standard ones. A fuller fix is to level *everything* to a common compression history and size distribution at training time but we observed that the hardened scores are very similar to the standard ones so this limitation is likely not too severe. 
+  from the same captions) so semantics stop correlating with the label.
+
+ * **Promptless images reduce accuracy.** We noticed in testing that promptless images (such as those generated in mass from deepai.org) tend to reduce accuracy significantly (~10% in some cases). This may be due to the CLIP embedding reverse engineering prompt semantics from images and using those for classification. Of course we cannot be sure that this is what is happening since CLIP embeddings themselves remain largely uninterpretable but with teh method described in the previous pointer this problem may also be solved (training with similar real and ai scenery would get rid of the prompt semantic shortcut if it exists). In any case, the use case for teh classsifier is to detect fake news images, which would normally require prompts to cretae a specific image in the real world so this problem should be trivial in  real world use case. 
+
+* **Both physics and pretrained model features are fitted with the same amount of data.** Since the pretrained models already have some information about images baked into them, they require less training than the physics and forensics features but the same amount of training was given to both which may be why the forensics side of the model seems to be contributing less to the accurasy. This is an observation we were able to make due to the high interpretability of Random Forests (with SHAP scores)
 * **The clusters act partly as a content prior.** The one-hot cluster id was meant to let the forest switch feature weights per image
   sub-type, but SHAP shows it also encodes "this kind of scene is usually real". Replacing the one-hot with per-cluster forests, or
   clustering on forensic rather than semantic features, would separate the two roles.
@@ -65,7 +68,8 @@ top; the defaults reproduce the shipped model (`SEED=42`).
 * **Single centre crop.** Features come from one 256-px crop (`N_CROPS` is a knob we did not have the compute to raise); multi-crop
   averaging would reduce variance on large images and on images with flat centres (screenshots produce NaN physics features today,
   imputed with medians).
-* **Calibration transfers only approximately.** Platt was fitted on the training distribution; probabilities on a new source are well-ranked but can be over-confident. Re-fitting Platt on a small labelled sample from the target domain is cheap and recommended.
+* **Calibration transfers only approximately.** Platt was fitted on the training distribution; probabilities on a new source are well-ranked but can be over-confident. Re-fitting Platt on a small labelled sample from the target domain is cheap and recommended. Note that though Isotonic calibration seems to give a better distribution we still use Platt as the main output since Isotonic fitting is prone to overfitting and we want the probabilities to be robust. 
+
 
 ## 5. Team member contributions
 
@@ -90,12 +94,9 @@ top; the defaults reproduce the shipped model (`SEED=42`).
 | `classify_folder.py` | CLI: folder of images → JSON of `real`/`ai` verdicts with probabilities. |
 | `classify_folder_error_analysis.py` | CLI: folder + labels → accuracy metrics, reliability diagrams (raw / Platt / isotonic), ROC, confusion matrix, per-source breakdown. |
 | `make_eval_subset.py` | Builds a labelled evaluation folder (COCO val2017 photos + DALL·E 3 images) straight from the public WildFake archives. |
-| `repickle_bundle.py` | Re-saves the model under a different scikit-learn version, after verifying it still reproduces the recorded metrics. |
 | `forensics_only_forest.py` | Retrains forests on feature subsets (full / forensics-only / …) from the training feature table and exports a forensics-only model. |
 | `dashboard.py` | Streamlit web app: pick a model (or several to compare), upload an image, apply transforms, get verdicts with SHAP explanation. |
 | `harden_eval_subset.py` | Writes a copy of an evaluation folder with compression history and image size equalised across classes — the dataset-shortcut test. |
-| `make_labels_from_folders.py` | Turns any folders of real / AI images (downloaded benchmarks, your own photos and generations) into a labelled evaluation folder. |
-| `make_submission.py` | Builds the judge-facing zip (scripts + model files, token blanked, no cache / venv / reports). |
 | `requirements_inference.txt` | Python dependencies. |
 | `meta.json`, `*.joblib`, `*.npy`, `srec_openimages.pth` / `zedlite.pt` | **The trained model** ("the bundle"). Keep them together with `meta.json`; the scripts find the bundle by the folder that contains `meta.json`. |
 | `aigc_export_*/` (optional) | Pre-exported variant models (e.g. `aigc_export_nozed` = no ZED coder, ~4× faster on CPU). Use with `--bundle aigc_export_nozed`. |
@@ -110,14 +111,30 @@ automatically on first use (~3 GB, one time, into your user cache).
 
 Download the folder from GitHub (https://github.com/v1vxk/TechJam-TickTock). The `aigc_rf_cache-….zip` file (produced when running the training notebook on Colab) is an optional 2GB download that is only required if you wish to retrain the random forest variants.
 
-Python **3.10 – 3.13** (3.13 is what the model was trained on; 3.14 has no prebuilt wheel for the pinned scikit-learn — see Troubleshooting for the `repickle_bundle.py` workaround).
-On Windows with several Pythons installed, `py -3.13 -m venv venv` picks 3.13 explicitly. From a terminal opened in this folder:
+### ⚠️ Step 1 — use Python 3.13 (not 3.14)
+
+The model files are scikit-learn pickles pinned to `scikit-learn==1.6.1`, which has **no prebuilt wheel for Python 3.14** — on 3.14, `pip install` tries to compile it from source and fails. Python 3.13 (the version the model was trained on) works out of the box.
+
+A virtual environment is permanently tied to the interpreter that created it, and `activate` does **not** choose a version — so the venv must be *created* with 3.13. If you already made one with `python -m venv`, delete the `venv` folder and start again.
 
 ```bash
-python -m venv venv
-venv\Scripts\activate                 # Windows
-# source venv/bin/activate            # macOS / Linux
+py --list                       # must show a 3.13 entry; if not, install Python 3.13 from python.org first
+py -3.13 -m venv venv           # Windows: create the venv with 3.13 explicitly
+venv\Scripts\activate         # PowerShell   (cmd: venv\Scripts\activate.bat)
+python --version              # MUST print 3.13.x — if it prints 3.14, delete venv/ and redo the line above
+```
 
+```bash
+python3.13 -m venv venv         # macOS / Linux
+source venv/bin/activate
+python --version                # must print 3.13.x
+```
+
+Do not run `pip install` until `python --version` says 3.13.
+
+### Step 2 — install the dependencies
+
+```bash
 pip install torch --index-url https://download.pytorch.org/whl/cpu    # CPU-only PyTorch (skip on macOS: the default wheel is already CPU)
 pip install -r requirements_inference.txt
 ```
@@ -269,8 +286,7 @@ python test_leakage.py --cache aigc_rf_cache-20260829T163203Z-1-001.zip --labels
 ## Troubleshooting
 
 * `Detector:` shows `VAEs=['sd15', 'sdxl']` only → FLUX needs a Hugging Face token (see Setup).
-* `pip install scikit-learn==1.6.1` tries to build with meson/Cython and fails → your Python is newer than 3.13 (no prebuilt wheel). Either recreate the venv with Python 3.13 (`py -3.13 -m venv venv`; this is the version Colab trained on), or keep your Python, remove the pin, and re-save the model under your scikit-learn version:
-  `python repickle_bundle.py --bundle . --cache aigc_rf_cache-20260829T163203Z-1-001.zip --out aigc_export_repickled` — it verifies the loaded forest reproduces the recorded test AUC before writing, then use `--bundle aigc_export_repickled` everywhere.
+* `pip install scikit-learn==1.6.1` tries to build with meson/Cython and fails → your Python is newer than 3.13 (no prebuilt wheel). Either recreate the venv with Python 3.13 (`py -3.13 -m venv venv`; this is the version Colab trained on)
 * `InconsistentVersionWarning` or `pickle` / `joblib` errors on load → scikit-learn version differs from the one in `meta.json`; `pip install scikit-learn==1.6.1`.
 * `git is not installed` / `FileNotFoundError: The system cannot find the file specified` on the first image → install Git (git-scm.com) and open a new terminal, or copy an existing `SReC` folder next to the scripts (it is shared by all bundles). Only bundles that use ZED need it.
 * Very slow → use `--fast`, or a smaller `--n-real/--n-ai`; step 5 is always fast thanks to the feature cache.
