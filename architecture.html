@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><title>AI-generated image detector — architecture</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mermaid/10.9.1/mermaid.min.js"></script>
+<style>
+ body{font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;max-width:1400px;margin:0 auto;padding:24px 32px;color:#1a1a1a;line-height:1.45}
+ h1{font-size:1.7em;margin-bottom:.2em} h2{margin-top:2em;border-bottom:2px solid #ddd;padding-bottom:.2em} h3{margin-top:1.4em}
+ .mermaid{background:#fff;border:1px solid #ddd;border-radius:8px;padding:12px;margin:16px 0;overflow-x:auto}
+ table{border-collapse:collapse;margin:12px 0} th,td{border:1px solid #ccc;padding:6px 10px;text-align:left;vertical-align:top} th{background:#f4f4f4}
+ code{background:#f4f4f4;padding:1px 4px;border-radius:3px} .note{background:#fff7e6;border-left:4px solid #c98a1a;padding:8px 12px;margin:12px 0}
+ .small{color:#555;font-size:.92em}
+</style></head><body>
+<h1>AI-generated image detection — full architecture</h1>
+<p class="small">Hand-crafted forensic features + frozen pretrained extractors → unsupervised image clusters → random forest → calibrated probability.
+Built for the TikTok TechJam image-forensics track. This page is meant to be readable by someone who has never seen the project.</p>
+
+<div class="note"><b>The one-paragraph version.</b> A detector that decides whether an image is a real photograph or AI-generated. Instead of training a big neural network end-to-end (which tends to learn the quirks of the training set rather than the physics of fake images), every image is turned into a row of about 130 numbers that each measure something specific — how camera noise behaves, what the frequency spectrum looks like, how well a generator’s own decoder can reproduce the image, how “surprising” the pixels are to a compressor trained on real photos, and what the image is <i>about</i>. A random forest then combines those numbers, is calibrated so its output is an honest probability, and is analysed to show which measurements it relies on for which kinds of images.</div>
+
+<h2>Diagram 1 — training and evaluation pipeline</h2>
+<pre class="mermaid">
+flowchart TB
+
+  subgraph S1["1 · DATA  —  three public datasets, fetched batch by batch (400 images at a time), deleted once featurised"]
+    direction LR
+    A1["SID_Set  (Hugging Face)<br/>real = OpenImages photos<br/>fake = FLUX generations<br/>tampered class dropped<br/>fetched one parquet shard at a time"]
+    A2["WildFake  (ModelScope, 39 zip archives)<br/>real = COCO · ImageNet · FFHQ · CelebA-HQ · AFHQ · LSUN church · LAION<br/>fake = GAN / diffusion / other families (DALL·E, SD, Midjourney, ADM, …)<br/>members read out of the remote zips with HTTP Range requests"]
+    A3["CIFAKE  (Kaggle)<br/>32 × 32 thumbnails<br/>real = CIFAR-10 · fake = SD 1.4<br/>→ separate low-resolution tier"]
+    A4["DEMO SET  (held out of training, asserted)<br/>= WildFake COCO val2017 + DALL·E 3 'Advanced'<br/>the organisers' evaluation subset"]
+  end
+
+  L["2 · LEVELLING  (per image, at ingestion)<br/>EXIF-transpose → RGB → long side ≤ 1024 → re-encode once as JPEG q95<br/>so real and fake share the same compression history<br/>(kills the 'PNG ⇒ fake' shortcut). Never squash-resized."]
+  A1 --> L
+  A2 --> L
+  A3 --> L
+  A4 --> L
+
+  G["3 · AUGMENTATION  (organisers' table)<br/>every base image → 2 rows: a clean copy + ONE random transform<br/>JPEG q 90/70/50/30 · Gaussian blur σ 0.5/1/2 · resize 0.5×/0.25× then upscale<br/>noise σ 0.02/0.05/0.10 · colour jitter ±20% · centre-crop 80%<br/>transform + level stored in the 'aug' column — used ONLY for error analysis, never as a model input"]
+  L --> G
+
+  subgraph V["4 · VIEWS  (built in memory)"]
+    direction LR
+    V1["256 × 256 native-resolution centre crop<br/>(no resizing → pixel statistics intact)"]
+    V2["CLIP view: short side → 224, centre crop<br/>(whole-scene content)"]
+  end
+  G --> V1
+  G --> V2
+
+  subgraph F["5 · FEATURE EXTRACTION  —  one row of numbers per image (≈ 130 columns)"]
+    direction LR
+    F1["PHYSICS TRIO  (0 parameters)<br/>• gradient-covariance anisotropy: real surfaces have strongly<br/>  oriented gradients (structure-tensor coherence over a 4×4 patch grid)<br/>• cross-scale consistency: dominant orientation should agree<br/>  between blur scales σ = 1 → 2 → 4<br/>• noise–signal decoupling: real sensor noise grows with brightness<br/>  and is independent of edges; generators couple noise to content<br/>• cross-channel residual correlation (camera demosaicing signature)"]
+    F2["FFT  (0 parameters)<br/>Hann-windowed log power spectrum → 32 radial bins,<br/>spectral slope, low/high-band energy share,<br/>peaks at ½ · ¼ · ⅛ Nyquist and on the Nyquist axes<br/>(upsampling / checkerboard grids of generators)"]
+    F3["CLIP ViT-L/14 vision tower  (≈ 304 M params, frozen)<br/>768-d embedding of the CLIP view →<br/>• PCA-16 (fitted on train) → 16 features<br/>• linear probe, CROSS-FITTED (5 group-aware folds) → 1 logit feature<br/>• input to the unsupervised clustering (step 6)"]
+    F4["AEROBLADE  (≈ 266 M params, frozen)<br/>crop → encode → decode through 3 latent-diffusion VAEs<br/>(SD 1.5 · SDXL · FLUX.1, ≈ 84 M each)<br/>generated images survive the round-trip almost losslessly, photos do not<br/>readout per VAE: LPIPS total + VGG layer-2 (VGG16, 14.7 M) · pixel MSE · VGG cosine · + min over VAEs"]
+    F5["ZED  coding-cost surprise<br/>SReC lossless coder pre-trained on real photos (4.2 M params)<br/>fallback: ZED-lite trained here on reserved reals (153 K params)<br/>per scale: mean NLL, mean entropy, NLL − entropy gap (mean, |mean|, std)<br/>real ≈ expected cost · generated = cheaper than expected"]
+  end
+  V1 --> F1
+  V1 --> F2
+  V2 --> F3
+  V1 --> F4
+  V1 --> F5
+
+  C["6 · UNSUPERVISED CLUSTERS  (image sub-types, unnamed)<br/>CLIP embedding → PCA-50 → k-means (K chosen by silhouette, min size 300)<br/>fitted on the TRAIN split only · cluster id enters the forest one-hot<br/>→ lets the forest weight features differently per sub-type"]
+  F3 --> C
+
+  T["FEATURE TABLE  (parquet on Drive, ~100 MB)<br/>rows = images × {clean, augmented} · columns = all features + cluster one-hot<br/>meta columns (dataset, generator, size, aug, …) kept for analysis, NEVER inputs"]
+  F1 --> T
+  F2 --> T
+  F3 --> T
+  F4 --> T
+  F5 --> T
+  C --> T
+
+  SP["7 · SPLITS  (by base image, so a clean/augmented pair is always on the same side)<br/>train 70 % · calibration 15 % · test 15 % — stratified by dataset × label<br/>demo set = 4th split, untouched"]
+  T --> SP
+
+  subgraph M["8 · MODEL"]
+    direction TB
+    RF["RANDOM FOREST  (400 trees, class-balanced)<br/>grid search over max_depth × min_samples_leaf × max_features<br/>with StratifiedGroupKFold (ROC-AUC) · refit with out-of-bag score<br/>LightGBM trained alongside as a reference line only"]
+    PL["PLATT CALIBRATION<br/>logistic regression on the forest's log-odds, fitted on the calibration split<br/>→ p(AI) is a real probability · isotonic shown for comparison"]
+    RF --> PL
+  end
+  SP -->|train split| RF
+  SP -->|calibration split| PL
+
+  subgraph E["9 · EVALUATION  &  INTERPRETATION"]
+    direction LR
+    E1["Metrics on TEST and DEMO<br/>ROC-AUC · accuracy · balanced accuracy<br/>Brier · ECE · reliability diagrams"]
+    E2["Error analysis using the 'aug' column<br/>accuracy by transform, level, dataset,<br/>generator, cluster · cluster × transform heat-map"]
+    E3["What does the forest use?<br/>permutation importance (accuracy & AUC)<br/>correlation-grouped importance · per-cluster importance<br/>feature drift per transform (from clean/aug pairs) · SHAP"]
+  end
+  PL --> E1
+  PL --> E2
+  RF --> E3
+
+  X["10 · EXPORT  →  aigc_export/<br/>forest · Platt · probe · PCAs · cluster model · SReC / ZED-lite weights · feature list · config"]
+  PL --> X
+  D1["classify_folder.py<br/>folder of images → JSON (real / ai, p(AI))"]
+  D2["dashboard.py  (Streamlit)<br/>upload → apply any training transform → verdict + probability + SHAP"]
+  X --> D1
+  X --> D2
+
+  classDef data fill:#e8f1fb,stroke:#3b6ea5,color:#111
+  classDef proc fill:#fff7e6,stroke:#c98a1a,color:#111
+  classDef feat fill:#eaf7ea,stroke:#3d8b3d,color:#111
+  classDef model fill:#f3e8fb,stroke:#7a3fa5,color:#111
+  classDef eval fill:#fbeaea,stroke:#a53b3b,color:#111
+  classDef deploy fill:#eeeeee,stroke:#555,color:#111
+  class A1,A2,A3,A4 data
+  class L,G,V1,V2,SP proc
+  class F1,F2,F3,F4,F5,C,T feat
+  class RF,PL model
+  class E1,E2,E3 eval
+  class X,D1,D2 deploy
+
+</pre>
+
+<h2>Diagram 2 — what happens to one image at inference (the CLI and the dashboard)</h2>
+<pre class="mermaid">
+flowchart LR
+  I["input image<br/>(upload, or one file of a folder)"] --> T["optional: apply one or more<br/>training transforms<br/>(dashboard only)"]
+  T --> L["level exactly as in training<br/>EXIF → RGB → ≤1024 → JPEG q95"]
+  L --> V1["256 × 256 native crop"]
+  L --> V2["CLIP view 224 × 224"]
+  V1 --> P["physics trio + FFT<br/>(0 params)"]
+  V1 --> A["AEROBLADE<br/>3 VAEs + LPIPS"]
+  V1 --> Z["ZED<br/>SReC or ZED-lite"]
+  V2 --> CL["CLIP ViT-L/14<br/>→ PCA-16 · probe logit"]
+  CL --> K["cluster id<br/>(nearest k-means centroid)<br/>→ one-hot"]
+  P --> R["feature row<br/>same columns and order as training<br/>(missing ones imputed with training medians)"]
+  A --> R
+  Z --> R
+  CL --> R
+  K --> R
+  R --> RF["random forest<br/>→ raw vote p_raw"]
+  RF --> PL["Platt scaling<br/>→ calibrated p(AI)"]
+  PL --> O["verdict: AI if p(AI) > 0.5, else REAL<br/>+ cluster + top SHAP contributions"]
+
+  classDef proc fill:#fff7e6,stroke:#c98a1a,color:#111
+  classDef feat fill:#eaf7ea,stroke:#3d8b3d,color:#111
+  classDef model fill:#f3e8fb,stroke:#7a3fa5,color:#111
+  class I,T,L,V1,V2 proc
+  class P,A,Z,CL,K,R feat
+  class RF,PL,O model
+
+</pre>
+
+<h2>Step-by-step, for a newcomer</h2>
+<h3>1 · Data</h3>
+<p>Three public datasets provide labelled real/fake images. Because the archives are enormous (WildFake alone is ~1 TB of zips), images are never downloaded in bulk: the notebook fetches a batch of 400, computes all features, writes one small table to Google Drive and deletes the images before fetching the next batch. WildFake members are read directly out of the remote zip files with HTTP Range requests, so only the zip’s table of contents and the sampled images ever cross the network. One WildFake slice — COCO val2017 photos plus DALL·E 3 (“Advanced”) generations — is the organisers’ <b>demo set</b>; it is held out of training entirely and the notebook asserts this.</p>
+<h3>2 · Levelling</h3>
+<p>Real photos usually arrive as JPEGs and generator outputs as PNGs. A classifier would happily learn “JPEG artefacts ⇒ real” — a shortcut that has nothing to do with authenticity. Every image is therefore re-encoded once as JPEG quality 95 so both classes share the same compression history. Images are only ever <i>cropped</i>, never squashed to a fixed size, because resizing alters exactly the pixel statistics the forensic features measure (and fakes are often square while photos are not — another shortcut).</p>
+<h3>3 · Augmentation</h3>
+<p>Images on social platforms get re-compressed, blurred, resized and colour-shifted. Each training image yields two rows: an untouched copy and one copy with a single random transform from the organisers’ table (JPEG, blur, resize-then-upscale, noise, colour jitter, centre crop) at a random severity. The transform and its level are recorded in an <code>aug</code> column that is <b>never</b> a model input — it exists so that, afterwards, accuracy can be broken down by transform and severity to see which features survive which degradations.</p>
+<h3>4 · Views</h3>
+<p>Two views are built in memory from each (possibly transformed) image: a 256×256 crop at native resolution for the forensic features, and a 224×224 whole-scene view for CLIP.</p>
+<h3>5 · Feature extraction — the heart of the method</h3>
+<table><tr><th>Family</th><th>Learned parameters</th><th>What it measures and why it separates real from fake</th></tr>
+<tr><td>Physics trio (adapted multiLID)</td><td>none</td><td>Three physical regularities of camera images. <b>Anisotropy</b>: real surfaces project to strongly oriented gradients (one eigenvalue of the local gradient covariance dominates); convolutional synthesis is more isotropic. <b>Cross-scale consistency</b>: for real structure the dominant orientation is the same whether you blur a little or a lot; multi-resolution generators break this. <b>Noise–signal decoupling</b>: sensor (shot) noise grows with brightness and is independent of edges; learned upsampling couples its residual noise to the content. Plus the correlation of noise between colour channels, a fingerprint of camera demosaicing.</td></tr>
+<tr><td>FFT</td><td>none</td><td>The radial power spectrum and a few scalars (slope, low/high-band energy share, peaks at ½, ¼, ⅛ of the Nyquist frequency). Upsampling layers leave periodic grids in the spectrum; low-frequency bands survive compression and blur, high ones do not.</td></tr>
+<tr><td>CLIP ViT-L/14 (vision tower)</td><td>≈ 304 M, frozen</td><td>A semantic embedding of the whole scene — what the image is about and its style. Used three ways: 16 principal components as features; a linear probe whose output is a feature (trained <i>cross-fitted</i>: every training row only ever receives a prediction from a probe that did not see it, so the forest cannot learn a leaked score); and as the space in which images are clustered. Caveat surfaced during development: on a single source pair (OpenImages vs FLUX) CLIP alone separates the classes by <i>content style</i>, which is a dataset shortcut — the multi-source training set and the demo set are what keep it honest.</td></tr>
+<tr><td>AEROBLADE</td><td>≈ 266 M, frozen (3 VAEs ≈ 84 M each + VGG16 14.7 M)</td><td>Latent-diffusion generators produce images through a decoder (a VAE). Push an image through such a VAE’s encoder and decoder: a generated image comes back almost unchanged, a real photo loses detail. The reconstruction distance (LPIPS total and VGG layer-2, pixel MSE, VGG-feature cosine) is computed for SD 1.5, SDXL and FLUX.1 VAEs, plus the minimum over the three.</td></tr>
+<tr><td>ZED</td><td>4.2 M (SReC) or 0.15 M (ZED-lite)</td><td>A lossless image coder trained only on real photographs has a model of how real pixels behave. For each pixel it predicts a probability distribution; the <i>actual</i> coding cost (−log p of the true value) and the <i>expected</i> cost (the distribution’s entropy) are compared. Real images cost about what the coder expects; generated images are “cheaper than they should be”. The gap, averaged per resolution level, is the feature. The pretrained SReC coder (Open Images) is used; if it cannot be loaded, a small ZED-lite coder is trained on 2,000 reserved real images that never enter the forest’s data.</td></tr></table>
+<h3>6 · Unsupervised clusters</h3>
+<p>Images are grouped into unnamed sub-types by k-means on their CLIP embedding (K chosen by silhouette score, each cluster at least 300 images, fitted on the training split only). The cluster id is fed to the forest one-hot, which lets it weight the features differently for, say, faces versus landscapes versus screenshots — and lets the analysis show <i>which</i> features matter for each sub-type. No human labels the clusters; a thumbnail grid is shown for inspection only.</p>
+<h3>7 · Splits</h3>
+<p>Train 70 % / calibration 15 % / test 15 %, stratified by dataset and label, and split by <b>base image</b> so a clean row and its augmented twin always land on the same side. The demo set is a fourth, untouched split.</p>
+<h3>8 · Model</h3>
+<p>A class-balanced random forest of 400 trees. Its hyper-parameters (tree depth, minimum leaf size, features per split) are chosen by an exhaustive grid search with group-aware cross-validation folds on ROC-AUC; the winner is refitted with an out-of-bag score. LightGBM is trained alongside purely as a reference line. Forest votes are not probabilities, so a one-feature logistic regression (Platt scaling) is fitted on the calibration split to map the forest’s log-odds to a calibrated p(AI); isotonic regression is drawn next to it for comparison.</p>
+<h3>9 · Evaluation and interpretation</h3>
+<p>ROC-AUC, accuracy, Brier score and expected calibration error on the test split and on the demo set, with reliability diagrams. The <code>aug</code> column gives accuracy by transform, severity, dataset, generator and cluster, including a cluster × transform heat-map on the demo set. Feature importance is computed by permutation (mean decrease in accuracy and in AUC), repeated for groups of correlated features (so collinear features do not dilute each other) and inside each cluster; the clean/augmented pairs give a “feature drift” table showing which features each transform destroys; SHAP values explain individual decisions.</p>
+<h3>10 · Deployment</h3>
+<p>Everything needed to score a new image is exported to one folder. <code>aigc_inference.py</code> rebuilds the whole pipeline from it (its feature code is copied verbatim from the notebook, so numbers match exactly); <code>classify_folder.py</code> scores a folder to JSON; <code>dashboard.py</code> is a Streamlit app where you upload an image, optionally apply the training transforms, and get a verdict with probability and SHAP contributions.</p>
+
+<h2>Parameter budget</h2>
+<table><tr><th>Component</th><th>Parameters</th></tr>
+<tr><td>CLIP ViT-L/14 vision tower + projection</td><td>≈ 304.0 M</td></tr>
+<tr><td>AEROBLADE — SD 1.5 VAE / SDXL VAE / FLUX.1 VAE</td><td>83.7 M / 83.7 M / 83.8 M</td></tr>
+<tr><td>AEROBLADE — LPIPS (VGG16 features + linear heads)</td><td>14.7 M</td></tr>
+<tr><td>ZED — SReC lossless coder (or ZED-lite)</td><td>4.20 M (or 0.15 M)</td></tr>
+<tr><td>Small heads trained here (probe, PCAs, clusters, Platt)</td><td>≈ 0.07 M</td></tr>
+<tr><td>Physics trio, FFT</td><td>0 — closed-form computations</td></tr>
+<tr><td><b>Total frozen / learned extractors</b></td><td><b>≈ 574 M</b></td></tr>
+<tr><td>Random forest</td><td>not parameters but split nodes; typically 1–3 M nodes for 400 trees — tiny and fully interpretable</td></tr></table>
+
+<h2>Glossary</h2>
+<table>
+<tr><td><b>ROC-AUC</b></td><td>Probability that a random fake scores higher than a random real; 0.5 = coin flip, 1.0 = perfect ranking.</td></tr>
+<tr><td><b>Calibration / Platt scaling</b></td><td>Making “p = 0.8” mean “80 % of such images are fake”. Platt fits a logistic curve on a held-out split; ECE and the Brier score measure how far predictions are from that ideal.</td></tr>
+<tr><td><b>Cross-fitting</b></td><td>Training a sub-model in folds so that every training row gets a prediction from a model that never saw it. Prevents the downstream forest from learning an over-confident, leaked feature.</td></tr>
+<tr><td><b>Group split</b></td><td>Splitting by base image, not by row, so an augmented copy can never be in the test set while its clean twin is in training.</td></tr>
+<tr><td><b>Permutation importance</b></td><td>Shuffle one feature’s values and measure how much accuracy drops. Features the forest actually uses hurt when shuffled.</td></tr>
+<tr><td><b>SHAP</b></td><td>Per-image attribution: how much each feature pushed this prediction towards “AI” or “real”.</td></tr>
+<tr><td><b>Dataset shortcut</b></td><td>A cue that separates the classes in the training data but has nothing to do with authenticity (file format, image size, prompt-like content). Levelling, cropping, multi-source data and the held-out demo set are the defences.</td></tr>
+</table>
+<script>mermaid.initialize({startOnLoad:true, theme:'neutral', securityLevel:'loose', flowchart:{htmlLabels:true, useMaxWidth:true}});</script>
+</body></html>

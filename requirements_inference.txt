@@ -1,0 +1,17 @@
+# environment for classify_folder.py / dashboard.py / evaluation scripts
+numpy
+pandas
+scipy
+scikit-learn==1.6.1   # MUST match the version in meta.json -> versions.sklearn (the model files are pickles); trained on Colab with 1.6.1
+joblib
+opencv-python
+pillow
+tqdm
+shap
+torch
+transformers
+diffusers
+accelerate
+lpips
+streamlit
+modelscope            # only for make_eval_subset.py (reads the evaluation images out of WildFake's remote zips)
