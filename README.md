@@ -111,7 +111,7 @@ automatically on first use (~3 GB, one time, into your user cache).
 
 Download the folder from GitHub (https://github.com/v1vxk/TechJam-TickTock). The `aigc_rf_cache-….zip` file (produced when running the training notebook on Colab) is an optional 2GB download that is only required if you wish to retrain the random forest variants.
 
-### ⚠️ Step 1 — use Python 3.13 (not 3.14)
+### ⚠️ Step 1 — use Python 3.12/3.13 (not 3.14)
 
 The model files are scikit-learn pickles pinned to `scikit-learn==1.6.1`, which has **no prebuilt wheel for Python 3.14** — on 3.14, `pip install` tries to compile it from source and fails. Python 3.13 (the version the model was trained on) works out of the box.
 
@@ -130,7 +130,7 @@ source venv/bin/activate
 python --version                # must print 3.13.x
 ```
 
-Do not run `pip install` until `python --version` says 3.13.
+Do not run `pip install` until `python --version` says 3.12/3.13
 
 ### Step 2 — install the dependencies
 
